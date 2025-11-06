@@ -1,0 +1,240 @@
+# ---- Install / load required packages ----
+if (!requireNamespace("GEOquery", quietly = TRUE)) install.packages("GEOquery")
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("limma", quietly = TRUE)) BiocManager::install("limma")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db")
+if (!requireNamespace("clusterProfiler", quietly = TRUE)) BiocManager::install("clusterProfiler")
+if (!requireNamespace("msigdbr", quietly = TRUE)) BiocManager::install("msigdbr")
+if (!requireNamespace("enrichplot", quietly = TRUE)) BiocManager::install("enrichplot")
+
+library(GEOquery)
+library(dplyr)
+library(tibble)
+library(limma)
+library(ggplot2)
+library(ggrepel)
+library(clusterProfiler)
+library(msigdbr)
+library(enrichplot)
+library(cowplot)
+
+# ---- 1. Download platform annotation for GPL1352 ----
+plat <- getGEO("GPL1352", AnnotGPL = FALSE)
+plat_tbl <- Table(plat)
+
+# ---- 2. Extract probe → gene symbol mapping ----
+probe2gene_manual <- plat_tbl %>%
+  dplyr::select(PROBEID = ID, SYMBOL = `Gene Symbol`) %>%
+  distinct() %>%
+  filter(SYMBOL != "")  # remove empty symbols
+
+# ---- 3. Download GSE43837 expression set ----
+gse <- getGEO("GSE43837", GSEMatrix = TRUE)
+expr_set <- gse[[1]]  # single platform
+
+# ---- 4. Extract expression matrix ----
+expr_mat <- exprs(expr_set)  # rows = probes, columns = samples
+
+# Convert to data.frame and add PROBEID
+expr_df <- as.data.frame(expr_mat) %>%
+  rownames_to_column(var = "PROBEID")
+
+# ---- 5. Map probes to genes ----
+expr_mapped <- expr_df %>%
+  left_join(probe2gene_manual, by = "PROBEID") %>%
+  filter(!is.na(SYMBOL))
+
+# ---- 6. Collapse multiple probes per gene (mean) ----
+expr_by_gene <- expr_mapped %>%
+  # Group by SYMBOL
+  group_by(SYMBOL) %>%
+  # Take mean of all numeric columns (i.e., all sample columns)
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  ungroup() %>%
+  # Set SYMBOL as rownames
+  column_to_rownames("SYMBOL")
+
+
+# ---- 7. Prepare metadata (if available in series) ----
+metadata_raw <- pData(expr_set) %>%
+  as_tibble(rownames = "gsm_id")
+
+# Example: assign sample groups based on title / description
+metadata <- metadata_raw %>%
+  mutate(
+    condition = case_when(
+      str_detect(title, regex("primary", ignore_case = TRUE)) ~ "Primary",
+      str_detect(title, regex("brain_met|metastatic", ignore_case = TRUE)) ~ "BrainMet",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(condition)) %>%
+  group_by(condition) %>%
+  mutate(rep = row_number()) %>%
+  ungroup()
+
+# Match expression columns to metadata order
+expr_by_gene <- expr_by_gene[, metadata$gsm_id]
+
+
+
+# ---- Log2-transform expression ----
+expr_log2 <- log2(expr_by_gene + 1)  # add 1 to avoid log2(0)
+
+# ---- Differential expression using limma ----
+design <- model.matrix(~0 + factor(metadata$condition))
+colnames(design) <- levels(factor(metadata$condition))
+
+fit <- lmFit(expr_log2, design)
+contrast.matrix <- makeContrasts(
+  BrainMet_vs_Primary = BrainMet - Primary,
+  levels = design
+)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# ---- Extract top genes (probes) ----
+top_genes <- topTable(fit2, coef = "BrainMet_vs_Primary", number = Inf, adjust.method = "fdr") %>%
+  rownames_to_column(var = "Probe")
+
+# ---- Volcano plot ----
+volcano <- top_genes %>%
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# Example: highlight tubulin probes
+tubulin_probes <- c("TUBB3", "TUBB4", "TUBA1A")  # add as needed
+
+# Top labels by |logFC|
+top_labels <- volcano %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 10)
+
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+
+ggplot(volcano, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  
+  # highlight tubulin probes
+  geom_point(data = volcano %>% filter(Probe %in% tubulin_probes),
+             shape = 21, fill = "black", size = 3) +
+  geom_text_repel(data = volcano %>% filter(Probe %in% tubulin_probes),
+                  aes(label = Probe), size = 4, color = "black") +
+  
+  # top labels
+  geom_text_repel(data = top_labels, aes(label = Probe), size = 4, color = "black") +
+  
+  scale_color_manual(values = c("Upregulated"="red", "Downregulated"="blue", "Not significant"="grey80")) +
+  labs(title="GSE43837: BrainMet vs Primary (Tubulin highlighted)", x="log2FC", y="-log10 adj.P.Val") +
+  theme_cowplot() +
+  theme(aspect.ratio = 1)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---- 8. Differential expression using limma ----
+design <- model.matrix(~0 + factor(metadata$condition))
+colnames(design) <- levels(factor(metadata$condition))
+
+fit <- lmFit(expr_by_gene, design)
+
+contrast.matrix <- makeContrasts(
+  BrainMet_vs_Primary = BrainMet - Primary,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# ---- 9. Extract top genes ----
+top_genes <- topTable(fit2, coef = "BrainMet_vs_Primary", number = Inf, adjust.method = "fdr") %>%
+  rownames_to_column(var = "Gene")
+
+summary(top_genes$adj.P.Val)
+
+
+# ---- 10. Volcano plot ----
+volcano <- top_genes %>%
+  mutate(
+    threshold = case_when(
+      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
+      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    ),
+    Gene_upper = toupper(Gene)
+  )
+
+# Optional: highlight tubulin / microtubule genes
+tubulin_genes <- c(
+  "TUBB1","TUBB2A","TUBB2B","TUBB3","TUBB4","TUBB5","TUBB6",
+  "TUBA1A","TUBA1B","TUBA1C","TUBA3A","TUBA4A","TUBA8"
+)
+
+ggplot(volcano, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  # Vertical lines at log2FC ±1
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  # Horizontal line at -log10(adjusted p-value 0.05)
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  # Highlight tubulin genes
+  geom_point(data = volcano %>% filter(Gene_upper %in% tubulin_genes), 
+             shape = 21, fill = "black", size = 3) +
+  geom_text_repel(data = volcano %>% filter(Gene_upper %in% tubulin_genes), 
+                  aes(label = Gene), size = 4) +
+  scale_color_manual(values = c("Upregulated"="red", "Downregulated"="blue", "Not significant"="grey80")) +
+  labs(title = "GSE43837: BrainMet vs Primary (Tubulin genes highlighted)", 
+       x = "log2FC", y = "-log10 adj.P.Val") +
+  theme_cowplot() +
+  theme(aspect.ratio = 1) +
+  # Ensure horizontal line is visible
+  expand_limits(y = c(0, max(-log10(volcano$adj.P.Val), na.rm = TRUE) + 1))
+
+
+# ---- 11. GSEA (optional) ----
+microtubule_genes <- msigdbr(species="Homo sapiens") %>%
+  filter(gs_collection=="C5", str_detect(gs_name, "MICROTUBULE")) %>%
+  select(gs_name, gene_symbol)
+
+rankedgenes <- top_genes$logFC
+names(rankedgenes) <- top_genes$Gene
+rankedgenes <- sort(rankedgenes, decreasing = TRUE)
+rankedgenes <- rankedgenes[!duplicated(names(rankedgenes))]
+
+gsea_microtub <- GSEA(
+  geneList = rankedgenes,
+  TERM2GENE = microtubule_genes,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 0.05,
+  minGSSize = 5,
+  maxGSSize = 500
+)
+
+# Example plot for top microtubule gene set
+top_set <- gsea_microtub@result$ID[1]
+gseaplot(gsea_microtub, geneSetID = top_set)
