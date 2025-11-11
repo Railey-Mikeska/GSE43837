@@ -36,23 +36,22 @@ expr_set <- gse[[1]]  # single platform
 expr_mat <- exprs(expr_set)  # rows = probes, columns = samples
 
 # Convert to data.frame and add PROBEID
-expr_df <- as.data.frame(expr_mat) %>%
-  rownames_to_column(var = "PROBEID")
+expr_df <- expr_df %>%
+  mutate(PROBEID_clean = sub("_3p_at$", "_at", PROBEID),
+         PROBEID_clean = sub("_5p_at$", "_at", PROBEID))
 
-# ---- 5. Map probes to genes ----
 expr_mapped <- expr_df %>%
-  left_join(probe2gene_manual, by = "PROBEID") %>%
-  filter(!is.na(SYMBOL))
+  left_join(probe2gene_manual, by = c("PROBEID_clean" = "PROBEID"))
+
 
 # ---- 6. Collapse multiple probes per gene (mean) ----
 expr_by_gene <- expr_mapped %>%
-  # Group by SYMBOL
+  filter(!is.na(SYMBOL)) %>%   # remove unmapped probes
   group_by(SYMBOL) %>%
-  # Take mean of all numeric columns (i.e., all sample columns)
   summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
   ungroup() %>%
-  # Set SYMBOL as rownames
   column_to_rownames("SYMBOL")
+
 
 
 # ---- 7. Prepare metadata (if available in series) ----
@@ -87,7 +86,7 @@ colnames(design) <- levels(factor(metadata$condition))
 
 fit <- lmFit(expr_log2, design)
 contrast.matrix <- makeContrasts(
-  BrainMet_vs_Primary = BrainMet - Primary,
+  BrainMet_vs_Primary = Primary - BrainMet,
   levels = design
 )
 fit2 <- contrasts.fit(fit, contrast.matrix)
@@ -106,6 +105,11 @@ volcano <- top_genes %>%
       TRUE ~ "Not significant"
     )
   )
+
+
+
+
+
 
 # Example: highlight tubulin probes
 tubulin_probes <- c("TUBB3", "TUBB4", "TUBA1A")  # add as needed
