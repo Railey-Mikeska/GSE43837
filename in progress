@@ -196,11 +196,11 @@ go_mt_genes_0005874 <- AnnotationDbi::select(
   keytype = "GOALL"
 )
 
-# Extract gene symbols and make uppercase
-go_mt_genes_0005874_vector <- toupper(go_mt_genes_0005874$SYMBOL)
 
 
-mt_genes_upper <- toupper(go_mt_genes_0005874_vector)
+mt_genes_upper <- toupper(go_mt_genes_0005874$SYMBOL)
+
+
 
 # ---- Prepare volcano data ----
 volcano_mt <- top_genes %>%
@@ -211,13 +211,13 @@ volcano_mt <- top_genes %>%
       TRUE       ~ "grey60"
     ),
     Gene_upper = toupper(Probe),  # ensure consistent casing
-    is_tubulin = Gene_upper %in% tubulin_genes_upper,
     is_mtgene = Gene_upper %in% mt_genes_upper
   )
 
 # ---- Subsets for labeling ----
-volcano_labels_tubulin <- volcano_mt %>% filter(is_tubulin)
-volcano_labels_mt <- volcano_mt %>% filter(is_mtgene & !is_tubulin)  # optional: other MT genes
+volcano_labels_mt <- volcano_mt %>% filter(is_mtgene)         # MT genes
+volcano_general   <- volcano_mt %>% filter(!is_mtgene)  
+
 
 # ---- Volcano plot ----
 library(ggplot2)
@@ -225,30 +225,22 @@ library(ggrepel)
 library(cowplot)
 
 ggplot() +
-  # 1️⃣ General points (gray/red/blue)
+  # 1️⃣ General points (red/blue/gray)
   geom_point(
-    data = volcano_mt %>% filter(!is_tubulin & !is_mtgene),
+    data = volcano_general,
     aes(x = logFC, y = -log10(adj.P.Val), color = fc_color),
     alpha = 0.5, size = 1.5
   ) +
-  # 2️⃣ Other MT genes in dark gray
+  # 2️⃣ MT genes (black, on top)
   geom_point(
     data = volcano_labels_mt,
-    aes(x = logFC, y = -log10(adj.P.Val)),
-    color = "darkgrey",
-    size = 2,
-    alpha = 0.7
-  ) +
-  # 3️⃣ Tubulin points in black (on top)
-  geom_point(
-    data = volcano_labels_tubulin,
     aes(x = logFC, y = -log10(adj.P.Val)),
     color = "black",
     size = 3
   ) +
-  # 4️⃣ Tubulin labels (on top of black points)
+  # 3️⃣ MT gene labels
   geom_text_repel(
-    data = volcano_labels_tubulin,
+    data = volcano_labels_mt,
     aes(x = logFC, y = -log10(adj.P.Val), label = Probe),
     color = "black",
     size = 3.5,
@@ -256,18 +248,40 @@ ggplot() +
     box.padding = 0.5,
     point.padding = 0.3
   ) +
-  # 5️⃣ Add dashed thresholds
+  # 4️⃣ Dashed thresholds
   geom_vline(xintercept = c(-2, 2), linetype = "dashed", color = "black", size = 0.5) +
   geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", size = 0.5) +
-  # 6️⃣ Color scale for red/blue/gray points
+  # 5️⃣ Color scale for red/blue/gray points
   scale_color_identity() +
-  # 7️⃣ Cowplot theme
+  # 6️⃣ Cowplot theme
   theme_cowplot(font_size = 14) +
   labs(
     x = "log2 Fold Change",
     y = "-log10(adj.P.Val)",
-    title = "Volcano Plot: Red/Blue/Gray + Tubulin in Black + MT Genes in Dark Gray"
+    title = "Volcano Plot: Red/Blue/Gray + MT Genes (GO:0005874) in Black"
   )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -298,10 +312,3 @@ gsea_microtub <- GSEA(
 # Example plot for top microtubule gene set
 top_set <- gsea_microtub@result$ID[1]
 gseaplot(gsea_microtub, geneSetID = top_set)
-
-
-
-
-
-
-
