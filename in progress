@@ -36,21 +36,22 @@ expr_set <- gse[[1]]  # single platform
 expr_mat <- exprs(expr_set)  # rows = probes, columns = samples
 
 # Convert to data.frame and add PROBEID
-expr_df <- expr_df %>%
+expr_df <- as.data.frame(expr_mat) %>%
+  rownames_to_column("PROBEID") %>%
   mutate(PROBEID_clean = sub("_3p_at$", "_at", PROBEID),
          PROBEID_clean = sub("_5p_at$", "_at", PROBEID))
+
 
 expr_mapped <- expr_df %>%
   left_join(probe2gene_manual, by = c("PROBEID_clean" = "PROBEID"))
 
 
 # ---- 6. Collapse multiple probes per gene (mean) ----
-expr_by_gene <- expr_mapped %>%
-  filter(!is.na(SYMBOL)) %>%   # remove unmapped probes
-  group_by(SYMBOL) %>%
-  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
-  ungroup() %>%
-  column_to_rownames("SYMBOL")
+expr_by_probe <- expr_mapped %>%
+  mutate(SYMBOL = ifelse(is.na(SYMBOL), PROBEID_clean, SYMBOL),
+         SYMBOL_unique = make.unique(SYMBOL)) %>%
+  column_to_rownames("SYMBOL_unique")
+
 
 
 
@@ -73,100 +74,45 @@ metadata <- metadata_raw %>%
   ungroup()
 
 # Match expression columns to metadata order
-expr_by_gene <- expr_by_gene[, metadata$gsm_id]
+expr_by_probe_1 <- expr_by_probe[, metadata$gsm_id]
 
 
 
 # ---- Log2-transform expression ----
-expr_log2 <- log2(expr_by_gene + 1)  # add 1 to avoid log2(0)
+expr_log2 <- log2(expr_by_probe_1 + 1)  # add 1 to avoid log2(0)
+
+
+
+
+
+# ---- Optional: Prefilter low-variance probes ----
+# Compute standard deviation across samples
+probe_sd <- apply(expr_log2, 1, sd)
+
+# Keep only probes with sufficient variability
+# You can adjust the threshold (0.25–0.5 typical)
+keep <- probe_sd > 0.5
+expr_filtered <- expr_log2[keep, ]
+
+cat("Retained", sum(keep), "of", length(keep), "probes after filtering.\n")
+
+
+
+
+
+
+
+
+
+
+
+
 
 # ---- Differential expression using limma ----
 design <- model.matrix(~0 + factor(metadata$condition))
 colnames(design) <- levels(factor(metadata$condition))
 
-fit <- lmFit(expr_log2, design)
-contrast.matrix <- makeContrasts(
-  BrainMet_vs_Primary = Primary - BrainMet,
-  levels = design
-)
-fit2 <- contrasts.fit(fit, contrast.matrix)
-fit2 <- eBayes(fit2)
-
-# ---- Extract top genes (probes) ----
-top_genes <- topTable(fit2, coef = "BrainMet_vs_Primary", number = Inf, adjust.method = "fdr") %>%
-  rownames_to_column(var = "Probe")
-
-# ---- Volcano plot ----
-volcano <- top_genes %>%
-  mutate(
-    threshold = case_when(
-      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
-      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
-      TRUE ~ "Not significant"
-    )
-  )
-
-
-
-
-
-
-# Example: highlight tubulin probes
-tubulin_probes <- c("TUBB3", "TUBB4", "TUBA1A")  # add as needed
-
-# Top labels by |logFC|
-top_labels <- volcano %>%
-  filter(threshold != "Not significant") %>%
-  arrange(desc(abs(logFC))) %>%
-  slice_head(n = 10)
-
-library(ggplot2)
-library(ggrepel)
-library(cowplot)
-
-ggplot(volcano, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
-  geom_point(alpha = 0.6, size = 1.8) +
-  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
-  
-  # highlight tubulin probes
-  geom_point(data = volcano %>% filter(Probe %in% tubulin_probes),
-             shape = 21, fill = "black", size = 3) +
-  geom_text_repel(data = volcano %>% filter(Probe %in% tubulin_probes),
-                  aes(label = Probe), size = 4, color = "black") +
-  
-  # top labels
-  geom_text_repel(data = top_labels, aes(label = Probe), size = 4, color = "black") +
-  
-  scale_color_manual(values = c("Upregulated"="red", "Downregulated"="blue", "Not significant"="grey80")) +
-  labs(title="GSE43837: BrainMet vs Primary (Tubulin highlighted)", x="log2FC", y="-log10 adj.P.Val") +
-  theme_cowplot() +
-  theme(aspect.ratio = 1)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ---- 8. Differential expression using limma ----
-design <- model.matrix(~0 + factor(metadata$condition))
-colnames(design) <- levels(factor(metadata$condition))
-
-fit <- lmFit(expr_by_gene, design)
+fit <- lmFit(expr_filtered, design)
 
 contrast.matrix <- makeContrasts(
   BrainMet_vs_Primary = BrainMet - Primary,
@@ -176,48 +122,158 @@ contrast.matrix <- makeContrasts(
 fit2 <- contrasts.fit(fit, contrast.matrix)
 fit2 <- eBayes(fit2)
 
-# ---- 9. Extract top genes ----
+# ---- Extract top genes (probes) ----
 top_genes <- topTable(fit2, coef = "BrainMet_vs_Primary", number = Inf, adjust.method = "fdr") %>%
-  rownames_to_column(var = "Gene")
+  rownames_to_column(var = "Probe")
 
-summary(top_genes$adj.P.Val)
+# ---- Volcano plot ----
+library(ggplot2)
+library(ggrepel)
+
+# Add a discrete color column based on logFC
+library(ggrepel)
 
 
-# ---- 10. Volcano plot ----
+
+
+
+# ---- Create volcano dataframe ----
 volcano <- top_genes %>%
   mutate(
-    threshold = case_when(
-      adj.P.Val < 0.05 & logFC > 1 ~ "Upregulated",
-      adj.P.Val < 0.05 & logFC < -1 ~ "Downregulated",
-      TRUE ~ "Not significant"
-    ),
-    Gene_upper = toupper(Gene)
+    fc_color = case_when(
+      logFC >  2  ~ "red",
+      logFC < -2  ~ "blue",
+      TRUE        ~ "grey60"
+    )
   )
 
-# Optional: highlight tubulin / microtubule genes
-tubulin_genes <- c(
-  "TUBB1","TUBB2A","TUBB2B","TUBB3","TUBB4","TUBB5","TUBB6",
-  "TUBA1A","TUBA1B","TUBA1C","TUBA3A","TUBA4A","TUBA8"
+
+
+# Subset only the red and blue genes for labeling
+volcano_labels <- volcano %>%
+  filter(fc_color %in% c("red", "blue"))
+
+ggplot(volcano, aes(x = logFC, y = -log10(adj.P.Val), color = fc_color)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_text_repel(
+    data = volcano_labels,
+    aes(label = Probe),
+    size = 3,
+    max.overlaps = 20
+  ) +
+  scale_color_identity() +
+  geom_vline(xintercept = c(-2, 2), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_minimal() +
+  labs(
+    x = "log2 Fold Change",
+    y = "-log10(P.Value)",
+    title = "Volcano Plot (Red/Blue labeled, Gray not)"
+  )
+
+
+
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# ---- Tubulin and microtubule genes (uppercase) ----
+tubulin_genes_upper <- toupper(c(
+  "TUBB1", "TUBB2A", "TUBB2B", "TUBB3", "TUBB4", "TUBB5", "TUBB6",
+  "TUBA1A", "TUBA1B", "TUBA1C", "TUBA3A", "TUBA4A", "TUBA8"
+))
+
+
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+# ---- GO:0005874 microtubule cytoskeleton genes ----
+go_mt_genes_0005874 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0005874",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
 )
 
-ggplot(volcano, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
-  geom_point(alpha = 0.6, size = 1.8) +
-  # Vertical lines at log2FC ±1
-  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
-  # Horizontal line at -log10(adjusted p-value 0.05)
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
-  # Highlight tubulin genes
-  geom_point(data = volcano %>% filter(Gene_upper %in% tubulin_genes), 
-             shape = 21, fill = "black", size = 3) +
-  geom_text_repel(data = volcano %>% filter(Gene_upper %in% tubulin_genes), 
-                  aes(label = Gene), size = 4) +
-  scale_color_manual(values = c("Upregulated"="red", "Downregulated"="blue", "Not significant"="grey80")) +
-  labs(title = "GSE43837: BrainMet vs Primary (Tubulin genes highlighted)", 
-       x = "log2FC", y = "-log10 adj.P.Val") +
-  theme_cowplot() +
-  theme(aspect.ratio = 1) +
-  # Ensure horizontal line is visible
-  expand_limits(y = c(0, max(-log10(volcano$adj.P.Val), na.rm = TRUE) + 1))
+# Extract gene symbols and make uppercase
+go_mt_genes_0005874_vector <- toupper(go_mt_genes_0005874$SYMBOL)
+
+
+mt_genes_upper <- toupper(go_mt_genes_0005874_vector)
+
+# ---- Prepare volcano data ----
+volcano_mt <- top_genes %>%
+  mutate(
+    fc_color = case_when(
+      logFC > 2  ~ "red",
+      logFC < -2 ~ "blue",
+      TRUE       ~ "grey60"
+    ),
+    Gene_upper = toupper(Probe),  # ensure consistent casing
+    is_tubulin = Gene_upper %in% tubulin_genes_upper,
+    is_mtgene = Gene_upper %in% mt_genes_upper
+  )
+
+# ---- Subsets for labeling ----
+volcano_labels_tubulin <- volcano_mt %>% filter(is_tubulin)
+volcano_labels_mt <- volcano_mt %>% filter(is_mtgene & !is_tubulin)  # optional: other MT genes
+
+# ---- Volcano plot ----
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+
+ggplot() +
+  # 1️⃣ General points (gray/red/blue)
+  geom_point(
+    data = volcano_mt %>% filter(!is_tubulin & !is_mtgene),
+    aes(x = logFC, y = -log10(adj.P.Val), color = fc_color),
+    alpha = 0.5, size = 1.5
+  ) +
+  # 2️⃣ Other MT genes in dark gray
+  geom_point(
+    data = volcano_labels_mt,
+    aes(x = logFC, y = -log10(adj.P.Val)),
+    color = "darkgrey",
+    size = 2,
+    alpha = 0.7
+  ) +
+  # 3️⃣ Tubulin points in black (on top)
+  geom_point(
+    data = volcano_labels_tubulin,
+    aes(x = logFC, y = -log10(adj.P.Val)),
+    color = "black",
+    size = 3
+  ) +
+  # 4️⃣ Tubulin labels (on top of black points)
+  geom_text_repel(
+    data = volcano_labels_tubulin,
+    aes(x = logFC, y = -log10(adj.P.Val), label = Probe),
+    color = "black",
+    size = 3.5,
+    max.overlaps = 20,
+    box.padding = 0.5,
+    point.padding = 0.3
+  ) +
+  # 5️⃣ Add dashed thresholds
+  geom_vline(xintercept = c(-2, 2), linetype = "dashed", color = "black", size = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", size = 0.5) +
+  # 6️⃣ Color scale for red/blue/gray points
+  scale_color_identity() +
+  # 7️⃣ Cowplot theme
+  theme_cowplot(font_size = 14) +
+  labs(
+    x = "log2 Fold Change",
+    y = "-log10(adj.P.Val)",
+    title = "Volcano Plot: Red/Blue/Gray + Tubulin in Black + MT Genes in Dark Gray"
+  )
+
+
+
+
+
+
 
 
 # ---- 11. GSEA (optional) ----
@@ -242,3 +298,10 @@ gsea_microtub <- GSEA(
 # Example plot for top microtubule gene set
 top_set <- gsea_microtub@result$ID[1]
 gseaplot(gsea_microtub, geneSetID = top_set)
+
+
+
+
+
+
+
