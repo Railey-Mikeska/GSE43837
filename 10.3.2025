@@ -1,0 +1,480 @@
+# ---- Install / load required packages ----
+if (!requireNamespace("GEOquery", quietly = TRUE)) install.packages("GEOquery")
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("limma", quietly = TRUE)) BiocManager::install("limma")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db")
+if (!requireNamespace("clusterProfiler", quietly = TRUE)) BiocManager::install("clusterProfiler")
+if (!requireNamespace("msigdbr", quietly = TRUE)) BiocManager::install("msigdbr")
+if (!requireNamespace("enrichplot", quietly = TRUE)) BiocManager::install("enrichplot")
+
+library(GEOquery)
+library(dplyr)
+library(tibble)
+library(limma)
+library(ggplot2)
+library(ggrepel)
+library(clusterProfiler)
+library(msigdbr)
+library(enrichplot)
+library(cowplot)
+
+# ---- 1. Download platform annotation for GPL1352 ----
+plat <- getGEO("GPL1352", AnnotGPL = FALSE)
+plat_tbl <- Table(plat)
+
+# ---- 2. Extract probe → gene symbol mapping ----
+probe2gene_manual <- plat_tbl %>%
+  dplyr::select(PROBEID = ID, SYMBOL = `Gene Symbol`) %>%
+  distinct() %>%
+  filter(SYMBOL != "")  # remove empty symbols
+
+# ---- 3. Download GSE43837 expression set ----
+gse <- getGEO("GSE43837", GSEMatrix = TRUE)
+expr_set <- gse[[1]]  # single platform
+
+# ---- 4. Extract expression matrix ----
+expr_mat <- exprs(expr_set)  # rows = probes, columns = samples
+
+# Convert to data.frame and add PROBEID
+expr_df <- as.data.frame(expr_mat) %>%
+  rownames_to_column("PROBEID") %>%
+  mutate(PROBEID_clean = sub("_3p_at$", "_at", PROBEID),
+         PROBEID_clean = sub("_5p_at$", "_at", PROBEID))
+
+
+expr_mapped <- expr_df %>%
+  left_join(probe2gene_manual, by = c("PROBEID_clean" = "PROBEID"))
+
+
+# ---- 6. Collapse multiple probes per gene (mean) ----
+expr_by_probe <- expr_mapped %>%
+  mutate(SYMBOL = ifelse(is.na(SYMBOL), PROBEID_clean, SYMBOL),
+         SYMBOL_unique = make.unique(SYMBOL)) %>%
+  column_to_rownames("SYMBOL_unique")
+
+
+
+
+# ---- 7. Prepare metadata (if available in series) ----
+metadata_raw <- pData(expr_set) %>%
+  as_tibble(rownames = "gsm_id")
+
+# Example: assign sample groups based on title / description
+metadata <- metadata_raw %>%
+  mutate(
+    condition = case_when(
+      str_detect(title, regex("primary", ignore_case = TRUE)) ~ "Primary",
+      str_detect(title, regex("brain_met|metastatic", ignore_case = TRUE)) ~ "BrainMet",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(condition)) %>%
+  group_by(condition) %>%
+  mutate(rep = row_number()) %>%
+  ungroup()
+
+# Match expression columns to metadata order
+expr_by_probe_1 <- expr_by_probe[, metadata$gsm_id]
+
+
+
+# ---- Log2-transform expression ----
+expr_log2 <- log2(expr_by_probe_1 + 1)  # add 1 to avoid log2(0)
+
+
+
+
+
+# ---- Optional: Prefilter low-variance probes ----
+# Compute standard deviation across samples
+probe_sd <- apply(expr_log2, 1, sd)
+
+# Keep only probes with sufficient variability
+# You can adjust the threshold (0.25–0.5 typical)
+keep <- probe_sd > 0.5
+expr_filtered <- expr_log2[keep, ]
+
+cat("Retained", sum(keep), "of", length(keep), "probes after filtering.\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---- Differential expression using limma ----
+design <- model.matrix(~0 + factor(metadata$condition))
+colnames(design) <- levels(factor(metadata$condition))
+
+fit <- lmFit(expr_filtered, design)
+
+contrast.matrix <- makeContrasts(
+  BrainMet_vs_Primary = BrainMet - Primary,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# ---- Extract top genes (probes) ----
+top_genes <- topTable(fit2, coef = "BrainMet_vs_Primary", number = Inf, adjust.method = "fdr") %>%
+  rownames_to_column(var = "Probe")
+
+
+# Add gene symbols for tubulin/GO lookup (does not affect original volcano)
+
+library(dplyr)
+library(stringr)
+library(purrr)
+
+# Join probe2gene_manual by Probe ID
+top_genes <- top_genes %>%
+  left_join(probe2gene_manual, by = c("Probe" = "PROBEID"))  # results in SYMBOL column
+
+
+
+# Now SYMBOL exists (or is NA), so we can clean it
+top_genes <- top_genes %>%
+  mutate(
+    SYMBOL = ifelse(is.na(SYMBOL) | SYMBOL == "", Probe, SYMBOL),
+    SYMBOL_clean = str_split(SYMBOL, " /// ") %>% map_chr(1),
+    Gene_upper = toupper(SYMBOL_clean)
+  )
+
+
+
+top_genes_collapsed <- top_genes %>%
+  group_by(SYMBOL_clean) %>%
+  summarize(
+    logFC       = mean(logFC),
+    AveExpr     = mean(AveExpr),
+    t           = mean(t),
+    P.Value     = mean(P.Value),
+    adj.P.Val   = mean(adj.P.Val),
+    B           = mean(B),
+    .groups = "drop"
+  ) %>%
+  mutate(Gene_upper = toupper(SYMBOL_clean))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+library(ggplot2)
+library(ggrepel)
+library(cowplot)  # for theme_cowplot
+
+
+# ---- 1. Create volcano data.frame ----
+volcano <- top_genes_collapsed %>%
+  mutate(
+    logFC = as.numeric(logFC),
+    adj.P.Val = as.numeric(adj.P.Val),
+    SYMBOL_clean = as.character(SYMBOL_clean),
+    threshold = case_when(
+      adj.P.Val < 0.2 & logFC > 1  ~ "Upregulated",
+      adj.P.Val < 0.2 & logFC < -1 ~ "Downregulated",
+      TRUE                          ~ "Not significant"
+    )
+  ) %>%
+  as.data.frame()
+
+
+# ---- 2. Select top 10 up and down for labeling ----
+top_labels <- volcano %>%
+  filter(threshold != "Not significant") %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = 10)
+
+
+# ---- 3. Plot ----
+ggplot(volcano, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = c(
+    "Upregulated" = "#E64B35",
+    "Downregulated" = "#377EB8",
+    "Not significant" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black", linewidth = 1) +
+  geom_hline(yintercept = -log10(0.2), linetype = "dashed", color = "black", linewidth = 1) +
+  geom_text_repel(
+    data = top_labels,
+    aes(label = SYMBOL_clean),
+    size = 4,
+    max.overlaps = 100,
+    color = "black"
+  ) +
+  labs(
+    title = "HER2+ Brain Mets vs Primary Tumor",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  ) +
+  theme_cowplot(font_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    axis.title = element_text(face = "bold", size = 16),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 12),
+    aspect.ratio = 1
+  )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+
+# ---- 1️⃣ Define gene lists ----
+tubulin_genes_upper <- toupper(c(
+  "TUBB1", "TUBB2A", "TUBB2B", "TUBB3", "TUBB4", "TUBB5", "TUBB6",
+  "TUBA1A", "TUBA1B", "TUBA1C", "TUBA3A", "TUBA4A", "TUBA8"
+))
+
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+# GO:0005874 microtubule cytoskeleton
+go_mt_genes_0005874 <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = "GO:0005874",
+  columns = c("SYMBOL", "GOALL"),
+  keytype = "GOALL"
+)
+mt_genes_upper <- toupper(go_mt_genes_0005874$SYMBOL)
+
+# ---- 2️⃣ Prepare volcano data ----
+volcano <- top_genes_collapsed %>%
+  mutate(
+    logFC = as.numeric(logFC),
+    adj.P.Val = as.numeric(adj.P.Val),
+    SYMBOL_clean = as.character(SYMBOL_clean),
+    Gene_upper = toupper(SYMBOL_clean),
+    threshold = case_when(
+      adj.P.Val < 0.2 & logFC > 1  ~ "Upregulated",
+      adj.P.Val < 0.2 & logFC < -1 ~ "Downregulated",
+      TRUE                          ~ "Not significant"
+    )
+  ) %>%
+  as.data.frame()
+
+# ---- 3️⃣ Subset genes for labeling ----
+# Tubulin genes
+volcano_tubulin_labels <- volcano %>%
+  filter(Gene_upper %in% tubulin_genes_upper & threshold != "Not significant")
+
+# Microtubule genes (GO:0005874)
+volcano_mt_labels <- volcano %>%
+  filter(Gene_upper %in% mt_genes_upper & threshold != "Not significant")
+
+
+
+# Tubulin volcano plot #
+# Plot
+ggplot(volcano, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  # Highlight tubulin genes with black points
+  geom_point(
+    data = volcano_tubulin_labels,
+    aes(x = logFC, y = -log10(adj.P.Val)),
+    color = "black",
+    size = 3
+  ) +
+  # Add labels only for red/blue points
+  geom_text_repel(
+    data = volcano_tubulin_labels,
+    aes(label = SYMBOL_clean),
+    size = 4,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black", linewidth = 1) +
+  geom_hline(yintercept = -log10(0.2), linetype = "dashed", color = "black", linewidth = 1) +
+  scale_color_manual(values = c(
+    "Upregulated" = "#E64B35",
+    "Downregulated" = "#377EB8",
+    "Not significant" = "grey80"
+  )) +
+  theme_cowplot(font_size = 14) +
+  theme(aspect.ratio = 1) +
+  labs(
+    title = "Volcano Plot: Tubulin Genes (Only Red/Blue Labeled)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  )
+
+
+
+
+
+
+# Microtubule (GO:0005874) volcano plot
+ggplot(volcano, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  geom_point(
+    data = volcano_mt_labels,
+    aes(x = logFC, y = -log10(adj.P.Val)),
+    color = "black",
+    size = 3
+  ) +
+  geom_text_repel(
+    data = volcano_mt_labels,
+    aes(label = SYMBOL_clean),
+    size = 4,
+    max.overlaps = 20,
+    color = "black"
+  ) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black", linewidth = 1) +
+  geom_hline(yintercept = -log10(0.2), linetype = "dashed", color = "black", linewidth = 1) +
+  scale_color_manual(values = c(
+    "Upregulated" = "#E64B35",
+    "Downregulated" = "#377EB8",
+    "Not significant" = "grey80"
+  )) +
+  theme_cowplot(font_size = 14) +
+  theme(aspect.ratio = 1) +
+  labs(
+    title = "Volcano Plot: Microtubule Genes (GO:0005874)",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value",
+    color = "Regulation"
+  )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---- 11. GSEA (optional) ----
+microtubule_genes <- msigdbr(species="Homo sapiens") %>%
+  dplyr::filter(gs_collection=="C5", stringr::str_detect(gs_name, "MICROTUBULE")) %>%
+  dplyr::select(gs_name, gene_symbol)
+
+
+rankedgenes <- top_genes$logFC
+names(rankedgenes) <- top_genes$Gene
+rankedgenes <- sort(rankedgenes, decreasing = TRUE)
+rankedgenes <- rankedgenes[!duplicated(names(rankedgenes))]
+
+gsea_microtub <- GSEA(
+  geneList = rankedgenes,
+  TERM2GENE = microtubule_genes,
+  pAdjustMethod = "fdr",
+  pvalueCutoff = 0.05,
+  minGSSize = 5,
+  maxGSSize = 500
+)
+
+# Example plot for top microtubule gene set
+top_set <- gsea_microtub@result$ID[1]
+gseaplot(gsea_microtub, geneSetID = top_set)
+
+
+
+
+dotplot(gsea_microtub, showCategory = 20)  # top 10 enriched microtubule gene sets
+
+
+
+
+
+
+
+
+
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(cowplot)
+
+# Ensure top_genes is a tibble
+top_genes <- as_tibble(top_genes)
+
+# ---- 1️⃣ Pick the top enriched gene set ----
+top_set <- gsea_microtub@result$ID[1]
+top_set_name <- gsea_microtub@result$Description[1]
+cat("Top enriched gene set:", top_set_name, "\n")
+
+# ---- 2️⃣ Get the core enriched genes for this set ----
+core_genes <- gsea_microtub@result %>%
+  filter(ID == top_set) %>%
+  pull(core_enrichment) %>%
+  str_split("/") %>%
+  unlist() %>%
+  unique()
+
+# ---- 3️⃣ Create dataframe of core genes with logFC ----
+core_genes_df <- top_genes %>%
+  filter(SYMBOL_clean %in% core_genes) %>%
+  mutate(
+    logFC = as.numeric(logFC),
+    SYMBOL_clean = as.character(SYMBOL_clean)
+  ) %>%
+  dplyr::select(Gene = SYMBOL_clean, logFC) %>%
+  distinct(Gene, .keep_all = TRUE)
+
+# ---- 4️⃣ Select top 10 up and top 10 down ----
+top_up   <- core_genes_df %>% arrange(desc(logFC)) %>% slice_head(n = 10)
+top_down <- core_genes_df %>% arrange(logFC)        %>% slice_head(n = 10)
+top_genes_plot <- bind_rows(top_up, top_down) %>%
+  mutate(Gene = factor(Gene, levels = Gene[order(logFC)]))  # order for plotting
+
+# ---- 5️⃣ Barplot ----
+ggplot(top_genes_plot, aes(x = Gene, y = logFC, fill = logFC > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue"), guide = FALSE) +
+  labs(
+    x = "Gene",
+    y = "log2 Fold Change",
+    title = paste("Top 10 Up & Down Core Genes in:", top_set_name)
+  ) +
+  theme_cowplot(font_size = 14)
